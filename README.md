@@ -93,26 +93,6 @@ python3 plugins/openyodel-hermes/test_client.py --key "your-key" --message "Hell
 
 Custom capabilities use namespacing: `hermes:skills`, `hermes:cron`, etc.
 
-## Why no WIRE Gateway?
-
-Hermes already does everything WIRE does — and more:
-
-| WIRE Gateway | Hermes Agent |
-|-------------|-------------|
-| Device registration | Platform auth via API key |
-| Agent CRUD | Provider config + Skills |
-| Device-agent binding | Platform routing + skill permissions |
-| API key injection | Provider layer (since v1) |
-| TTS audio cache | Hermes TTS (extensible) |
-| Dashboard | Hermes Dashboard + CLI |
-| **Skills, Cron, Delegation, Memory** | ✅ (WIRE has none of these) |
-| **License** | Open Source (WIRE is proprietary) |
-
-See [ADR-001](decisions/ADR-001-yodel-platform-adapter.md) for the full rationale.
-
-## Architecture Decisions
-
-- [ADR-001](decisions/ADR-001-yodel-platform-adapter.md) — Why a platform adapter, not WIRE middleware
 - [ADR-002](decisions/ADR-002-implementation-decisions.md) — HTTP server, correlation, SSE, auth choices
 
 ## Repository Structure
@@ -139,7 +119,6 @@ openyodel/
 
 - [Yodel Protocol Spec](https://github.com/openyodel/spec) — The open protocol
 - [Hermes Agent](https://github.com/nousresearch/hermes-agent) — The AI agent platform
-- [WIRE Gateway Spec](https://github.com/moongrabber/wire-gateway-spec) — Reference gateway (private)
 
 ## License
 
