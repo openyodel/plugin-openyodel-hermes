@@ -1,4 +1,4 @@
-# ADR-002: Implementation Decisions for Yodel Adapter
+# ADR-001: Implementation Decisions for Yodel Adapter
 
 **Status:** Accepted  
 **Date:** 2026-06-23  
@@ -78,6 +78,5 @@ und Device-Kontext-Injektion.
 
 ## References
 
-- [ADR-001: Yodel Platform Adapter](ADR-001-yodel-platform-adapter.md)
 - [Implementation: `plugins/openyodel-hermes/adapter.py`](../plugins/openyodel-hermes/adapter.py)
 - [Yodel Protocol Spec §6: Request Format](https://github.com/openyodel/spec/blob/main/v1/spec.md#6-request-format)
