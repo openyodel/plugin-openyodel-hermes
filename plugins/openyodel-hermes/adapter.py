@@ -146,9 +146,8 @@ class YodelAdapter(BasePlatformAdapter):
         self.bind_address = os.getenv("YODEL_BIND_ADDRESS") or extra.get("bind_address", "0.0.0.0")
         self.api_key = os.getenv("YODEL_API_KEY") or extra.get("api_key", "")
         self._server: Optional[asyncio.AbstractServer] = None
-        # Map: chat_id -> asyncio.Event that fires when response is ready
+        # Map: chat_id -> asyncio.Queue that receives response text, then None sentinel
         self._pending_responses: dict[str, asyncio.Queue[str]] = {}
-        self._response_complete: dict[str, asyncio.Event] = {}
 
     # ── BasePlatformAdapter interface ──────────────────────────────
 
@@ -182,9 +181,7 @@ class YodelAdapter(BasePlatformAdapter):
         Route agent response back to waiting HTTP handlers.
         Uses chat_id to correlate with pending Yodel requests.
         """
-        # Check if there's a pending Yodel request waiting for this response
         queue = self._pending_responses.get(chat_id)
-        complete = self._response_complete.get(chat_id)
 
         if queue and metadata and metadata.get("_yodel_stream"):
             # Streaming mode: push chunks to queue
@@ -214,7 +211,8 @@ class YodelAdapter(BasePlatformAdapter):
     ) -> None:
         """Handle a single HTTP connection."""
         try:
-            raw = await asyncio.wait_for(reader.read(65536), timeout=30.0)
+            # Read request with 4 MB limit for multimodal content (Issue #8)
+            raw = await asyncio.wait_for(reader.read(4 * 1024 * 1024), timeout=30.0)
             if not raw:
                 return
 
@@ -236,7 +234,17 @@ class YodelAdapter(BasePlatformAdapter):
         except asyncio.TimeoutError:
             pass
         except Exception as e:
-            self.logger.error(f"[yodel] Client error: {e}")
+            # Issue #7: return 500 instead of silent disconnect
+            self.logger.error(f"[yodel] Internal error: {e}")
+            try:
+                resp = build_http_response(
+                    500,
+                    json_error("Internal server error", "internal_error", "internal_error"),
+                )
+                writer.write(resp)
+                await writer.drain()
+            except Exception:
+                pass
         finally:
             writer.close()
             try:
@@ -376,38 +384,19 @@ class YodelAdapter(BasePlatformAdapter):
 
         # ── Build chat_id (must be unique per request!) ───────
         # Use device_id + random suffix to avoid collision on parallel requests
+        # Session is tracked separately — NOT appended (Issue #1: corrupted session_id echo)
         device_base = yodel_device_id or "anon"
         request_suffix = uuid.uuid4().hex[:8]
         chat_id = f"{device_base}:{request_suffix}"
-        if yodel_session:
-            chat_id = f"{chat_id}:{yodel_session}"
 
         # ── Build Hermes MessageEvent ───────────────────────────
-        # Inject device context into the message metadata
-        device_context = ""
-        if device_type:
-            device_context += f"[Device: {device_type}"
-            if device_capabilities:
-                device_context += f", capabilities: {', '.join(device_capabilities)}"
-            device_context += "]"
-
-        if input_lang:
-            device_context += f"\n[Input language: {input_lang}]"
-
-        if yodel_agent:
-            device_context += f"\n[Agent: {yodel_agent}]"
-
-        if yodel_input == "voice":
-            device_context += "\n[Input mode: voice — user spoke this message]"
-
-        # Append device context to the message
-        full_content = content
-        if device_context:
-            full_content = f"{device_context}\n\n{content}"
+        # Issue #9: Remove device context text injection — rely on
+        # metadata + platform_hint. The user message stays clean.
+        # Device context flows via MessageEvent.metadata below.
 
         event = MessageEvent(
             chat_id=chat_id,
-            content=full_content,
+            content=content,  # Clean user message — no device context prefix
             message_type=MessageType.TEXT,
             sender_id=yodel_device_id or chat_id,
             sender_name=yodel_device_id or "yodel-device",
@@ -416,11 +405,13 @@ class YodelAdapter(BasePlatformAdapter):
                 "yodel_device_id": yodel_device_id,
                 "yodel_mode": yodel_mode,
                 "yodel_input": yodel_input,
+                "yodel_session": yodel_session,
                 "yodel_device_type": device_type,
                 "yodel_capabilities": device_capabilities,
                 "yodel_input_lang": input_lang,
                 "tts_requested": tts_block.get("requested", False),
                 "tts_voice": tts_block.get("voice", ""),
+                "tts_provider": tts_block.get("provider", ""),  # Issue #3: parse provider
                 "tts_format": tts_block.get("format", "opus"),
             },
         )
@@ -435,7 +426,8 @@ class YodelAdapter(BasePlatformAdapter):
         # ── Stream SSE response ─────────────────────────────────
         try:
             await self._stream_sse_response(
-                writer, response_queue, data.get("model", "hermes"), chat_id
+                writer, response_queue, data.get("model", "hermes"),
+                chat_id, yodel_session,
             )
         finally:
             self._pending_responses.pop(chat_id, None)
@@ -446,6 +438,7 @@ class YodelAdapter(BasePlatformAdapter):
         queue: asyncio.Queue,
         model: str,
         chat_id: str,
+        yodel_session: str = "",
     ) -> None:
         """Stream Hermes' response back as SSE chunks."""
         # Write SSE headers
@@ -512,10 +505,10 @@ class YodelAdapter(BasePlatformAdapter):
             # Send finish chunk
             writer.write(sse_chunk(chunk_id, "", model=model, finish_reason="stop"))
 
-            # Send Yodel event with session info
+            # Send Yodel event with session info (Issue #1: echo original session_id)
             yodel_event = json.dumps({
                 "yodel": {
-                    "session_id": chat_id,
+                    "session_id": yodel_session or chat_id,
                 }
             })
             writer.write(sse_event(yodel_event))
@@ -576,10 +569,13 @@ def register(ctx):
         cron_deliver_env_var="YODEL_HOME_CHANNEL",
         max_message_length=8000,
         platform_hint=(
-            "You are chatting via a Yodel-compatible device. The user's device "
-            "capabilities, type, and input mode are provided in the message context. "
-            "Adapt your response based on device capabilities (e.g., be concise for "
-            "audio-only devices, provide visual descriptions for camera devices)."
+            "You are chatting via a Yodel-compatible device. Device metadata "
+            "(type, capabilities, input mode, language) is available in the "
+            "message metadata. Adapt your response: be concise and avoid "
+            "markdown for audio-only devices; use rich formatting for devices "
+            "with display; expect image analysis for camera devices. "
+            "Check message.metadata.yodel_device_type and "
+            "message.metadata.yodel_capabilities to adapt."
         ),
         emoji="📡",
     )

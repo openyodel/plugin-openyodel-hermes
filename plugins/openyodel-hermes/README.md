@@ -57,7 +57,8 @@ hermes config set YODEL_BIND_ADDRESS 0.0.0.0  # optional
 | X-Yodel-Input | ✅ |
 | X-Yodel-Session | ✅ |
 | yodel.device (type + capabilities) | ✅ |
-| yodel.tts | ✅ (metadata, TTS handled by Hermes) |
+| yodel.tts (parsing: requested, voice, provider, format) | ✅ |
+| yodel.tts (tts_url generation) | 🔲 Future (Hermes TTS integration pending) |
 | yodel.input_lang | ✅ |
 | SSE streaming | ✅ |
 | Bearer token auth | ✅ |

@@ -71,7 +71,8 @@ python3 plugins/openyodel-hermes/test_client.py --key "your-key" --message "Hell
 | `X-Yodel-Input` (voice/text) | ✅ |
 | `X-Yodel-Session` | ✅ |
 | `yodel.device` (type + capabilities) | ✅ |
-| `yodel.tts` (requested, voice, provider, format) | ✅ |
+| `yodel.tts` (parsing: requested, voice, provider, format) | ✅ |
+| `yodel.tts` (tts_url generation in response) | 🔲 Future |
 | `yodel.input_lang` (BCP 47) | ✅ |
 | SSE streaming (`text/event-stream`) | ✅ |
 | OpenAI-compatible chunk format | ✅ |
@@ -93,26 +94,26 @@ python3 plugins/openyodel-hermes/test_client.py --key "your-key" --message "Hell
 
 Custom capabilities use namespacing: `hermes:skills`, `hermes:cron`, etc.
 
-- [ADR-002](decisions/ADR-002-implementation-decisions.md) — HTTP server, correlation, SSE, auth choices
+- [ADR-001](decisions/ADR-002-implementation-decisions.md) — HTTP server, correlation, SSE, auth choices
 
 ## Repository Structure
 
 ```
 openyodel/
-├── README.md                           # This file
-├── decisions/                          # Architecture Decision Records
-│   ├── ADR-001-yodel-platform-adapter.md
+├── README.md
+├── LICENSE (MIT)
+├── decisions/
 │   └── ADR-002-implementation-decisions.md
-├── docs/                               # Extended documentation
-│   ├── device-scenarios.md             # Walkie-talkie, camera, printer examples
-│   └── configuration.md                # Full configuration reference
+├── docs/
+│   ├── device-scenarios.md
+│   └── configuration.md
 └── plugins/
-    └── openyodel-hermes/               # Hermes plugin
-        ├── plugin.yaml                 # Plugin metadata
-        ├── adapter.py                  # Yodel HTTP server + adapter
-        ├── test_client.py              # Test client
-        ├── install.sh                  # Setup script
-        └── README.md                   # Plugin README
+    └── openyodel-hermes/
+        ├── adapter.py
+        ├── plugin.yaml
+        ├── test_client.py
+        ├── install.sh
+        └── README.md
 ```
 
 ## Related Projects
