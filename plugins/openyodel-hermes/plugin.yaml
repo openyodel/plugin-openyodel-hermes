@@ -1,0 +1,26 @@
+name: openyodel
+label: Open Yodel
+kind: platform
+version: 1.0.0-draft
+description: |
+  Yodel protocol platform adapter for Hermes Agent.
+  Accepts Yodel-compatible requests from any Yodel-speaking device
+  (iOS, Android, Web PWA, IoT, walkie-talkie, camera, etc.)
+  and routes them through Hermes.
+author: Roland Strahlhofer
+requires_env:
+  - name: YODEL_PORT
+    description: "Port for the Yodel HTTP server"
+    prompt: "Yodel Port"
+    password: false
+  - name: YODEL_API_KEY
+    description: "API key for Yodel device authentication (Bearer token)"
+    prompt: "Yodel API Key"
+    password: true
+optional_env:
+  - name: YODEL_BIND_ADDRESS
+    description: "Bind address (default: 0.0.0.0)"
+    password: false
+  - name: YODEL_HOME_CHANNEL
+    description: "Default channel for cron delivery via Yodel"
+    password: false
