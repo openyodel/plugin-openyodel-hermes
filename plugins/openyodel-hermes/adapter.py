@@ -11,10 +11,13 @@ Protocol: https://github.com/openyodel/spec
 import asyncio
 import hmac
 import json
+import logging
 import os
 import uuid
 from http import HTTPStatus
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -137,7 +140,7 @@ class YodelAdapter(BasePlatformAdapter):
         self._tasks: set[asyncio.Task] = set()
 
         if not self.api_key:
-            self.logger.warning("[yodel] No API key configured — endpoint will reject all requests. "
+            logger.warning("[yodel] No API key configured — endpoint will reject all requests. "
                                 "Set YODEL_API_KEY environment variable.")
 
     # ── BasePlatformAdapter interface ──────────────────────────────
@@ -150,7 +153,7 @@ class YodelAdapter(BasePlatformAdapter):
             port=self.port,
         )
         self._mark_connected()
-        self.logger.info(f"Yodel endpoint listening on http://{self.bind_address}:{self.port}")
+        logger.info(f"Yodel endpoint listening on http://{self.bind_address}:{self.port}")
         return True
 
     async def disconnect(self) -> None:
@@ -189,7 +192,7 @@ class YodelAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         # Fallback: no pending HTTP handler — log the response
-        self.logger.info(f"[yodel] Uncorrelated response for chat_id={chat_id}")
+        logger.info(f"[yodel] Uncorrelated response for chat_id={chat_id}")
         return SendResult(success=True)
 
     async def get_chat_info(self, chat_id: str) -> dict:
@@ -256,7 +259,7 @@ class YodelAdapter(BasePlatformAdapter):
             pass
         except Exception as e:
             # Issue #7: return 500 instead of silent disconnect
-            self.logger.error(f"[yodel] Internal error: {e}")
+            logger.error(f"[yodel] Internal error: {e}")
             try:
                 resp = build_http_response(
                     500,
@@ -628,9 +631,9 @@ class YodelAdapter(BasePlatformAdapter):
             await writer.drain()
 
         except ConnectionResetError:
-            self.logger.debug("[yodel] Client disconnected during streaming")
+            logger.debug("[yodel] Client disconnected during streaming")
         except Exception as e:
-            self.logger.error(f"[yodel] SSE stream error: {e}")
+            logger.error(f"[yodel] SSE stream error: {e}")
 
 
 # ── Plugin Registration ───────────────────────────────────────────────
