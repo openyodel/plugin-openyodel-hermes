@@ -142,7 +142,7 @@ class YodelAdapter(BasePlatformAdapter):
 
     # ── BasePlatformAdapter interface ──────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, is_reconnect: bool = False) -> bool:
         """Start the Yodel HTTP server."""
         self._server = await asyncio.start_server(
             self._handle_client,
