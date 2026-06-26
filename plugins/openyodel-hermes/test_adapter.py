@@ -556,6 +556,28 @@ class TestAdapterIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn("400", call_args)
         self.assertIn("invalid_session_mode", call_args)
 
+    async def test_invalid_input_mode_rejected(self):
+        """#2: Unknown X-Yodel-Input should return 400."""
+        writer = AsyncMock()
+
+        await self.adapter._handle_yodel_request(
+            writer,
+            {
+                "authorization": "Bearer test-secret-key",
+                "x-yodel-input": "telepathy",
+            },
+            json.dumps({
+                "model": "hermes",
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+                "yodel": {"device": {"type": "terminal", "capabilities": []}},
+            }).encode("utf-8"),
+        )
+
+        call_args = writer.write.call_args[0][0].decode("utf-8", errors="replace")
+        self.assertIn("400", call_args)
+        self.assertIn("invalid_input_mode", call_args)
+
     async def test_valid_request_proceeds(self):
         """A fully valid request should produce SSE output."""
         self.adapter.handle_message = AsyncMock()

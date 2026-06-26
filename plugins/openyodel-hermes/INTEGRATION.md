@@ -225,6 +225,7 @@ Danach wird der Stream geschlossen. Kein `[DONE]`, kein Finish-Chunk.
 | 400 | `invalid_device_type` | Unbekannter `device.type` | Gültigen Typ verwenden |
 | 400 | `invalid_capabilities` | Unbekannte Capability | Nur bekannte Werte senden |
 | 400 | `invalid_session_mode` | Unbekannter `mode` | `ephemeral` oder `persistent` |
+| 400 | `invalid_input_mode` | Unbekannter `X-Yodel-Input` | `text` oder `voice` |
 | 400 | `missing_message` | Keine User-Nachricht | Mindestens eine User-Message |
 | 401 | `invalid_auth_token` | Fehlender/falscher Header | `Authorization: Bearer <key>` |
 | 401 | `invalid_api_key` | Falscher Key | Key prüfen |

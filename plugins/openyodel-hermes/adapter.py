@@ -47,6 +47,8 @@ YODEL_CAPABILITIES = {
 
 SESSION_MODES = {"ephemeral", "persistent"}
 
+YODEL_INPUT_MODES = {"text", "voice"}
+
 # ── HTTP Helpers ──────────────────────────────────────────────────────
 
 
@@ -442,6 +444,20 @@ class YodelAdapter(BasePlatformAdapter):
                     f"Unknown session mode: {yodel_mode}. Valid: {', '.join(sorted(SESSION_MODES))}",
                     "validation_error",
                     "invalid_session_mode",
+                ),
+            )
+            writer.write(resp)
+            await writer.drain()
+            return
+
+        # Validate input mode
+        if yodel_input not in YODEL_INPUT_MODES:
+            resp = build_http_response(
+                400,
+                json_error(
+                    f"Unknown input mode: {yodel_input}. Valid: {', '.join(sorted(YODEL_INPUT_MODES))}",
+                    "validation_error",
+                    "invalid_input_mode",
                 ),
             )
             writer.write(resp)
