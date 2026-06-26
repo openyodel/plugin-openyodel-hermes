@@ -9,13 +9,12 @@ Protocol: https://github.com/openyodel/spec
 """
 
 import asyncio
+import hmac
 import json
 import os
-import time
 import uuid
 from http import HTTPStatus
 from typing import Optional
-from urllib.parse import urljoin
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -24,6 +23,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.config import Platform, PlatformConfig
+from gateway.session import SessionSource
 
 
 # ── Yodel Protocol Constants ──────────────────────────────────────────
@@ -47,25 +47,6 @@ SESSION_MODES = {"ephemeral", "persistent"}
 # ── HTTP Helpers ──────────────────────────────────────────────────────
 
 
-def parse_http_request(raw: bytes) -> tuple[str, str, dict[str, str], bytes]:
-    """Parse a raw HTTP request. Returns (method, path, headers, body)."""
-    parts = raw.split(b"\r\n\r\n", 1)
-    header_block = parts[0]
-    body = parts[1] if len(parts) > 1 else b""
-
-    lines = header_block.split(b"\r\n")
-    request_line = lines[0].decode("utf-8", errors="replace")
-    method, path, _ = request_line.split(" ", 2)
-
-    headers = {}
-    for line in lines[1:]:
-        if b":" in line:
-            key, value = line.decode("utf-8", errors="replace").split(":", 1)
-            headers[key.strip().lower()] = value.strip()
-
-    return method.upper(), path, headers, body
-
-
 def build_http_response(
     status: int,
     body: bytes = b"",
@@ -83,6 +64,10 @@ def build_http_response(
 
     response += f"Content-Length: {len(body)}\r\n"
     response += "Connection: keep-alive\r\n"
+    # CORS headers for web/PWA device support (#10)
+    response += "Access-Control-Allow-Origin: *\r\n"
+    response += "Access-Control-Allow-Headers: Authorization, Content-Type, X-Yodel-Version, X-Yodel-Device, X-Yodel-Agent, X-Yodel-Mode, X-Yodel-Input, X-Yodel-Session\r\n"
+    response += "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n"
     response += "\r\n"
     return response.encode("utf-8") + body
 
@@ -116,7 +101,7 @@ def sse_chunk(
     choice = {"index": 0, "delta": {}, "finish_reason": finish_reason}
     if delta_content:
         choice["delta"]["content"] = delta_content
-    else:
+    elif finish_reason is None:
         choice["delta"]["role"] = "assistant"
 
     event = json.dumps({
@@ -148,6 +133,12 @@ class YodelAdapter(BasePlatformAdapter):
         self._server: Optional[asyncio.AbstractServer] = None
         # Map: chat_id -> asyncio.Queue that receives response text, then None sentinel
         self._pending_responses: dict[str, asyncio.Queue[str]] = {}
+        # Tracking for in-flight asyncio.Tasks to prevent GC (#15)
+        self._tasks: set[asyncio.Task] = set()
+
+        if not self.api_key:
+            self.logger.warning("[yodel] No API key configured — endpoint will reject all requests. "
+                                "Set YODEL_API_KEY environment variable.")
 
     # ── BasePlatformAdapter interface ──────────────────────────────
 
@@ -211,17 +202,47 @@ class YodelAdapter(BasePlatformAdapter):
     ) -> None:
         """Handle a single HTTP connection."""
         try:
-            # Read request with 4 MB limit for multimodal content (Issue #8)
-            raw = await asyncio.wait_for(reader.read(4 * 1024 * 1024), timeout=30.0)
-            if not raw:
+            # Read HTTP headers first, then body by Content-Length (#12 fix)
+            header_raw = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), timeout=30.0
+            )
+
+            # Parse request line and headers
+            header_text = header_raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            hlines = header_text.split("\r\n")
+            request_line = hlines[0]
+            method, path, _ = request_line.split(" ", 2)
+
+            headers = {}
+            for line in hlines[1:]:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    headers[key.strip().lower()] = value.strip()
+
+            # Read body exactly by Content-Length (avoids truncation)
+            content_length = int(headers.get("content-length", "0"))
+            max_body = 4 * 1024 * 1024  # 4 MB limit
+            if content_length > max_body:
+                resp = build_http_response(
+                    413,
+                    json_error("Request body too large", "validation_error", "body_too_large"),
+                )
+                writer.write(resp)
+                await writer.drain()
                 return
 
-            method, path, headers, body = parse_http_request(raw)
+            body = b""
+            if content_length > 0:
+                body = await asyncio.wait_for(
+                    reader.readexactly(content_length), timeout=30.0
+                )
 
             if method == "GET" and path == HEALTH_ENDPOINT:
                 await self._handle_health(writer)
             elif method == "GET" and path == WELL_KNOWN_ENDPOINT:
                 await self._handle_well_known(writer)
+            elif method == "OPTIONS":
+                await self._handle_cors_preflight(writer)
             elif method == "POST" and path == YODEL_ENDPOINT:
                 await self._handle_yodel_request(writer, headers, body)
             else:
@@ -282,6 +303,12 @@ class YodelAdapter(BasePlatformAdapter):
         writer.write(build_http_response(200, body))
         await writer.drain()
 
+    async def _handle_cors_preflight(self, writer: asyncio.StreamWriter) -> None:
+        """Handle CORS preflight OPTIONS request (#10)."""
+        resp = build_http_response(204)  # No Content
+        writer.write(resp)
+        await writer.drain()
+
     async def _handle_yodel_request(
         self, writer: asyncio.StreamWriter, headers: dict[str, str], body: bytes
     ) -> None:
@@ -302,7 +329,20 @@ class YodelAdapter(BasePlatformAdapter):
             return
 
         token = auth_header[7:]
-        if self.api_key and token != self.api_key:
+        if not self.api_key:
+            resp = build_http_response(
+                503,
+                json_error(
+                    "Yodel endpoint not configured — API key missing on server",
+                    "configuration_error",
+                    "api_key_not_configured",
+                ),
+            )
+            writer.write(resp)
+            await writer.drain()
+            return
+
+        if not hmac.compare_digest(token, self.api_key):
             resp = build_http_response(
                 401,
                 json_error(
@@ -331,7 +371,22 @@ class YodelAdapter(BasePlatformAdapter):
             await writer.drain()
             return
 
+        # Validate stream:true — Yodel v1 is streaming-only (#11)
+        if not data.get("stream", False):
+            resp = build_http_response(
+                400,
+                json_error(
+                    "Yodel v1 requires stream: true",
+                    "validation_error",
+                    "streaming_required",
+                ),
+            )
+            writer.write(resp)
+            await writer.drain()
+            return
+
         # ── Extract Yodel headers ───────────────────────────────
+        yodel_version = headers.get("x-yodel-version", "")
         yodel_agent = headers.get("x-yodel-agent", "")
         yodel_device_id = headers.get("x-yodel-device", "")
         yodel_mode = headers.get("x-yodel-mode", "ephemeral")
@@ -346,6 +401,49 @@ class YodelAdapter(BasePlatformAdapter):
 
         device_type = device_block.get("type", "terminal")
         device_capabilities = device_block.get("capabilities", [])
+
+        # Validate device type against known types (#18)
+        if device_type not in YODEL_DEVICE_TYPES:
+            resp = build_http_response(
+                400,
+                json_error(
+                    f"Unknown device type: {device_type}. Valid types: {', '.join(sorted(YODEL_DEVICE_TYPES))}",
+                    "validation_error",
+                    "invalid_device_type",
+                ),
+            )
+            writer.write(resp)
+            await writer.drain()
+            return
+
+        # Validate capabilities against known set
+        unknown_caps = [c for c in device_capabilities if c not in YODEL_CAPABILITIES]
+        if unknown_caps:
+            resp = build_http_response(
+                400,
+                json_error(
+                    f"Unknown device capabilities: {', '.join(unknown_caps)}. Valid: {', '.join(sorted(YODEL_CAPABILITIES))}",
+                    "validation_error",
+                    "invalid_capabilities",
+                ),
+            )
+            writer.write(resp)
+            await writer.drain()
+            return
+
+        # Validate session mode
+        if yodel_mode not in SESSION_MODES:
+            resp = build_http_response(
+                400,
+                json_error(
+                    f"Unknown session mode: {yodel_mode}. Valid: {', '.join(sorted(SESSION_MODES))}",
+                    "validation_error",
+                    "invalid_session_mode",
+                ),
+            )
+            writer.write(resp)
+            await writer.drain()
+            return
 
         # ── Extract messages ────────────────────────────────────
         messages = data.get("messages", [])
@@ -392,28 +490,36 @@ class YodelAdapter(BasePlatformAdapter):
         # ── Build Hermes MessageEvent ───────────────────────────
         # Issue #9: Remove device context text injection — rely on
         # metadata + platform_hint. The user message stays clean.
-        # Device context flows via MessageEvent.metadata below.
+        # Device context flows via SessionSource and raw_message.
+
+        source = SessionSource(
+            platform=self.platform,
+            chat_id=chat_id,
+            user_id=yodel_device_id or chat_id,
+            user_name=yodel_device_id or "yodel-device",
+        )
+
+        yodel_metadata = {
+            "yodel_version": yodel_version,
+            "yodel_agent": yodel_agent,
+            "yodel_device_id": yodel_device_id,
+            "yodel_mode": yodel_mode,
+            "yodel_input": yodel_input,
+            "yodel_session": yodel_session,
+            "yodel_device_type": device_type,
+            "yodel_capabilities": device_capabilities,
+            "yodel_input_lang": input_lang,
+            "tts_requested": tts_block.get("requested", False),
+            "tts_voice": tts_block.get("voice", ""),
+            "tts_provider": tts_block.get("provider", ""),
+            "tts_format": tts_block.get("format", "opus"),
+        }
 
         event = MessageEvent(
-            chat_id=chat_id,
-            content=content,  # Clean user message — no device context prefix
+            text=content,  # Clean user message — no device context prefix
             message_type=MessageType.TEXT,
-            sender_id=yodel_device_id or chat_id,
-            sender_name=yodel_device_id or "yodel-device",
-            metadata={
-                "yodel_agent": yodel_agent,
-                "yodel_device_id": yodel_device_id,
-                "yodel_mode": yodel_mode,
-                "yodel_input": yodel_input,
-                "yodel_session": yodel_session,
-                "yodel_device_type": device_type,
-                "yodel_capabilities": device_capabilities,
-                "yodel_input_lang": input_lang,
-                "tts_requested": tts_block.get("requested", False),
-                "tts_voice": tts_block.get("voice", ""),
-                "tts_provider": tts_block.get("provider", ""),  # Issue #3: parse provider
-                "tts_format": tts_block.get("format", "opus"),
-            },
+            source=source,
+            raw_message=yodel_metadata,
         )
 
         # ── Set up response correlation ─────────────────────────
@@ -421,7 +527,9 @@ class YodelAdapter(BasePlatformAdapter):
         self._pending_responses[chat_id] = response_queue
 
         # ── Fire message into Hermes (non-blocking) ─────────────
-        asyncio.create_task(self.handle_message(event))
+        task = asyncio.create_task(self.handle_message(event))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
         # ── Stream SSE response ─────────────────────────────────
         try:
@@ -447,6 +555,7 @@ class YodelAdapter(BasePlatformAdapter):
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
             "Connection: keep-alive\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
             "\r\n"
         )
         writer.write(headers.encode("utf-8"))
@@ -473,7 +582,8 @@ class YodelAdapter(BasePlatformAdapter):
                         }
                     })
                     writer.write(sse_event(error_data))
-                    break
+                    await writer.drain()
+                    return
 
                 if chunk is None:
                     # Sentinel: response complete
@@ -494,7 +604,7 @@ class YodelAdapter(BasePlatformAdapter):
                 sent_role = True
 
             # Stream accumulated text as chunks (word-by-word for smooth UX)
-            words = accumulated.split(" ")
+            words = accumulated.split()
             for i, word in enumerate(words):
                 spacer = " " if i > 0 and i < len(words) else ""
                 delta = f"{spacer}{word}" if i > 0 else word
@@ -536,7 +646,13 @@ def validate_config(config) -> bool:
     """Validate the Yodel configuration."""
     extra = getattr(config, "extra", {}) or {}
     port = os.getenv("YODEL_PORT") or extra.get("port")
-    return bool(port)
+    api_key = os.getenv("YODEL_API_KEY") or extra.get("api_key", "")
+    if not port:
+        return False
+    if not api_key:
+        # Warn but don't block — the adapter will reject requests at runtime
+        pass
+    return True
 
 
 def _env_enablement() -> dict | None:
