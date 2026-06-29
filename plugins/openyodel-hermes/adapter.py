@@ -236,6 +236,7 @@ class YodelAdapter(BasePlatformAdapter):
         """
         queue = self._pending_responses.get(chat_id)
         if not queue:
+            logger.debug(f"[yodel-debug] send_draft: no queue for {chat_id}")
             return SendResult(success=True)
 
         # Compute delta: only send new content since last frame
@@ -247,6 +248,14 @@ class YodelAdapter(BasePlatformAdapter):
             delta = content
 
         self._last_sent_per_chat[chat_id] = content
+
+        logger.debug(
+            f"[yodel-debug] send_draft chat={chat_id} last={len(last_text)}c "
+            f"content={len(content)}c delta={len(delta)}c "
+            f"startswith={content.startswith(last_text)} "
+            f"delta_preview={repr(delta[:60])} "
+            f"content_preview={repr(content[:60])}"
+        )
 
         if delta:
             await queue.put(delta)
