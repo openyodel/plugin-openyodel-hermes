@@ -140,6 +140,8 @@ class YodelAdapter(BasePlatformAdapter):
         self._pending_responses: dict[str, asyncio.Queue[str]] = {}
         # Tracking for in-flight asyncio.Tasks to prevent GC (#15)
         self._tasks: set[asyncio.Task] = set()
+        # Per-chat last sent text for delta computation in send_draft
+        self._last_sent_per_chat: dict[str, str] = {}
 
         if not self.api_key:
             logger.warning("[yodel] No API key configured — endpoint will reject all requests. "
@@ -173,9 +175,12 @@ class YodelAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[dict] = None,
     ) -> SendResult:
-        """
-        Route agent response back to waiting HTTP handlers.
-        Uses chat_id to correlate with pending Yodel requests.
+        """Route agent response back to waiting HTTP handlers.
+
+        When the stream consumer has already delivered content via
+        ``send_draft()``, skip re-pushing the full text — only send the
+        None sentinel to signal completion.  This avoids duplicate content
+        in the SSE stream.
         """
         queue = self._pending_responses.get(chat_id)
 
@@ -184,13 +189,18 @@ class YodelAdapter(BasePlatformAdapter):
             chunk = metadata.get("_yodel_chunk", content)
             await queue.put(chunk)
             if metadata.get("_yodel_done"):
-                await queue.put(None)  # Sentinel
+                await queue.put(None)
+                self._last_sent_per_chat.pop(chat_id, None)
             return SendResult(success=True)
 
         if queue:
-            # Full response mode: deliver complete text
-            await queue.put(content)
-            await queue.put(None)  # Sentinel
+            # Check if content was already streamed via send_draft()
+            already_streamed = bool(self._last_sent_per_chat.get(chat_id, ""))
+            if not already_streamed:
+                await queue.put(content)
+            # Always send sentinel to signal completion
+            await queue.put(None)
+            self._last_sent_per_chat.pop(chat_id, None)
             return SendResult(success=True)
 
         # Fallback: no pending HTTP handler — log the response
@@ -199,6 +209,47 @@ class YodelAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> dict:
         return {"name": f"yodel:{chat_id}", "type": "dm"}
+
+    def supports_draft_streaming(
+        self,
+        chat_type: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> bool:
+        """Yodel always supports draft streaming — all connections are SSE."""
+        return True
+
+    async def send_draft(
+        self,
+        chat_id: str,
+        draft_id: int,
+        content: str,
+        metadata: Optional[dict] = None,
+    ) -> SendResult:
+        """Push a streaming delta to the Yodel SSE writer.
+
+        Called by GatewayStreamConsumer for each buffered text frame.
+        Computes the delta from the last sent text and pushes it to the
+        response queue so ``_stream_sse_response`` can emit an SSE event
+        immediately — giving true token-by-token streaming to Yodel clients.
+        """
+        queue = self._pending_responses.get(chat_id)
+        if not queue:
+            return SendResult(success=True)
+
+        # Compute delta: only send new content since last frame
+        last_text = self._last_sent_per_chat.get(chat_id, "")
+        if content.startswith(last_text):
+            delta = content[len(last_text):]
+        else:
+            # Non-contiguous update (e.g. new segment after tool call)
+            delta = content
+
+        self._last_sent_per_chat[chat_id] = content
+
+        if delta:
+            await queue.put(delta)
+
+        return SendResult(success=True)
 
     # ── HTTP Server ────────────────────────────────────────────────
 
@@ -558,6 +609,7 @@ class YodelAdapter(BasePlatformAdapter):
             )
         finally:
             self._pending_responses.pop(chat_id, None)
+            self._last_sent_per_chat.pop(chat_id, None)
 
     async def _stream_sse_response(
         self,
@@ -567,7 +619,12 @@ class YodelAdapter(BasePlatformAdapter):
         chat_id: str,
         yodel_session: str = "",
     ) -> None:
-        """Stream Hermes' response back as SSE chunks."""
+        """Stream Hermes' response back as SSE chunks in real time.
+
+        Pushes each chunk from the queue directly to the SSE writer as it
+        arrives — no accumulate-then-replay.  This gives true first-token
+        latency (typically <200ms) instead of waiting for the full response.
+        """
         # Write SSE headers
         headers = (
             "HTTP/1.1 200 OK\r\n"
@@ -582,12 +639,9 @@ class YodelAdapter(BasePlatformAdapter):
 
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         sent_role = False
+        any_content = False
 
         try:
-            # Wait for the full response text
-            accumulated = ""
-            response_received = False
-
             while True:
                 try:
                     chunk = await asyncio.wait_for(queue.get(), timeout=120.0)
@@ -606,30 +660,27 @@ class YodelAdapter(BasePlatformAdapter):
 
                 if chunk is None:
                     # Sentinel: response complete
-                    response_received = True
                     break
 
-                accumulated += chunk
-                response_received = True
+                if not chunk:
+                    continue
 
-            if not response_received:
+                any_content = True
+
+                # Send role chunk before first content delta
+                if not sent_role:
+                    writer.write(sse_chunk(chunk_id, "", model=model))
+                    sent_role = True
+
+                # Stream this chunk immediately — no accumulation
+                writer.write(sse_chunk(chunk_id, chunk, model=model))
+                await writer.drain()
+
+            # ── Stream complete — send termination events ──────────
+            if not any_content:
                 writer.write(sse_event("[DONE]"))
                 await writer.drain()
                 return
-
-            # Send role chunk first
-            if not sent_role:
-                writer.write(sse_chunk(chunk_id, "", model=model))
-                sent_role = True
-
-            # Stream accumulated text as chunks (word-by-word for smooth UX)
-            words = accumulated.split()
-            for i, word in enumerate(words):
-                spacer = " " if i > 0 and i < len(words) else ""
-                delta = f"{spacer}{word}" if i > 0 else word
-                writer.write(sse_chunk(chunk_id, delta, model=model))
-                await writer.drain()
-                await asyncio.sleep(0.02)  # Small delay for natural streaming feel
 
             # Send finish chunk
             writer.write(sse_chunk(chunk_id, "", model=model, finish_reason="stop"))
