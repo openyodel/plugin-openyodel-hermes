@@ -190,7 +190,6 @@ class YodelAdapter(BasePlatformAdapter):
             await queue.put(chunk)
             if metadata.get("_yodel_done"):
                 await queue.put(None)
-                self._last_sent_per_chat.pop(chat_id, None)
             return SendResult(success=True)
 
         if queue:
@@ -200,7 +199,10 @@ class YodelAdapter(BasePlatformAdapter):
                 await queue.put(content)
             # Always send sentinel to signal completion
             await queue.put(None)
-            self._last_sent_per_chat.pop(chat_id, None)
+            # NOTE: do NOT pop _last_sent_per_chat here — the gateway may
+            # call send() a second time (fallback dispatch), and the flag
+            # prevents duplicate content. Cleanup happens in the finally
+            # block of _handle_yodel_request.
             return SendResult(success=True)
 
         # Fallback: no pending HTTP handler — log the response
