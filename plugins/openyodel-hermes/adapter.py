@@ -184,14 +184,6 @@ class YodelAdapter(BasePlatformAdapter):
         """
         queue = self._pending_responses.get(chat_id)
 
-        if queue and metadata and metadata.get("_yodel_stream"):
-            # Streaming mode: push chunks to queue
-            chunk = metadata.get("_yodel_chunk", content)
-            await queue.put(chunk)
-            if metadata.get("_yodel_done"):
-                await queue.put(None)
-            return SendResult(success=True)
-
         if queue:
             # Check if content was already streamed via send_draft()
             already_streamed = bool(self._last_sent_per_chat.get(chat_id, ""))
